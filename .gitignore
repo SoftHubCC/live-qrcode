@@ -20,7 +20,11 @@
 
 # misc
 .DS_Store
+# secrets
 *.pem
+.github_token.txt
+github_token.txt
+token*.txt
 
 # debug
 npm-debug.log*
