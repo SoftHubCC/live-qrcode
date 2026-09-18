@@ -1,150 +1,77 @@
-import { kv } from "@vercel/kv";
 import { NextResponse } from "next/server";
+import { isAdmin, unauthorized } from "@/lib/auth";
+import { getLiveCode, listTargets, addTarget } from "@/lib/db";
+import type { Target } from "@/lib/types";
 
-interface Target {
-  id: string;
-  live_code_id: string;
-  type: "qr" | "link" | "file";
-  value: string;
-  image?: string;
-  label: string;
-  note: string;
-  is_active: number;
-  created_at: string;
+export const dynamic = "force-dynamic";
+
+interface RouteContext {
+  params: { id: string };
 }
 
-async function getTargets(codeId: string): Promise<Target[]> {
-  const targets = await kv.lrange(`targets:${codeId}`, 0, -1);
-  return targets.map((t) => JSON.parse(t));
+/** 自动补全协议头，避免用户输入 www.xxx.com 后打不开 */
+function normalizeUrl(raw: string): string {
+  const value = raw.trim();
+  if (!value) return value;
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`;
 }
 
-async function saveTarget(target: Target): Promise<void> {
-  await kv.lpush(`targets:${target.live_code_id}`, JSON.stringify(target));
-}
-
-async function deleteTarget(codeId: string, targetId: string): Promise<void> {
-  const targets = await getTargets(codeId);
-  const filtered = targets.filter((t) => t.id !== targetId);
-  await kv.del(`targets:${codeId}`);
-  for (const t of filtered) {
-    await kv.lpush(`targets:${codeId}`, JSON.stringify(t));
-  }
-}
-
-async function setTargetActive(codeId: string, targetId: string): Promise<void> {
-  const targets = await getTargets(codeId);
-  for (const t of targets) {
-    t.is_active = t.id === targetId ? 1 : 0;
-  }
-  await kv.del(`targets:${codeId}`);
-  for (const t of targets) {
-    await kv.lpush(`targets:${codeId}`, JSON.stringify(t));
-  }
-}
-
-async function updateTarget(codeId: string, targetId: string, updates: Partial<Target>): Promise<void> {
-  const targets = await getTargets(codeId);
-  const target = targets.find((t) => t.id === targetId);
-  if (target) {
-    Object.assign(target, updates);
-    await kv.del(`targets:${codeId}`);
-    for (const t of targets) {
-      await kv.lpush(`targets:${codeId}`, JSON.stringify(t));
-    }
-  }
-}
-
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
-
-function verifyAdmin(req: Request): boolean {
-  const auth = req.headers.get("authorization");
-  return auth === `Bearer ${ADMIN_PASSWORD}`;
-}
-
-// GET all targets for a code
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+/** GET /api/live-codes/:id/targets —— 目标列表 */
+export async function GET(_request: Request, { params }: RouteContext) {
   try {
-    const { id } = await params;
-    const targets = await getTargets(id);
+    const targets = await listTargets(params.id);
     return NextResponse.json({ targets });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to fetch targets" }, { status: 500 });
+    console.error("GET targets failed:", error);
+    return NextResponse.json({ error: "读取失败" }, { status: 500 });
   }
 }
 
-// POST - add new target
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+/** POST /api/live-codes/:id/targets —— 新增目标 */
+export async function POST(request: Request, { params }: RouteContext) {
+  if (!isAdmin(request)) return unauthorized();
 
   try {
-    const { id } = await params;
-    const body = await request.json();
-    const { type, value, label, note, image } = body;
+    const code = await getLiveCode(params.id);
+    if (!code) {
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
+    }
 
-    if (!type || !value) {
-      return NextResponse.json({ error: "Type and value are required" }, { status: 400 });
+    const body = await request.json();
+    const label = String(body.label || "").trim();
+    const note = String(body.note || "").trim();
+    const image = body.image ? String(body.image) : undefined;
+    let value = String(body.value || "").trim();
+
+    if (!value && !image) {
+      return NextResponse.json(
+        { error: "目标和内容不能同时为空" },
+        { status: 400 }
+      );
+    }
+
+    // 链接类型自动补全协议头
+    if (code.type === "link" && value && !image) {
+      value = normalizeUrl(value);
     }
 
     const target: Target = {
       id: crypto.randomUUID().slice(0, 8),
-      live_code_id: id,
-      type,
+      live_code_id: code.id,
+      type: code.type,
       value,
-      label: label || "",
-      note: note || "",
-      image: image || undefined,
-      is_active: 0,
+      image,
+      label,
+      note,
+      // 如果是第一个目标，直接设为活跃
+      is_active: (await listTargets(code.id)).length === 0 ? 1 : 0,
       created_at: new Date().toISOString(),
     };
 
-    await saveTarget(target);
+    await addTarget(target);
     return NextResponse.json({ success: true, target });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to create target" }, { status: 500 });
-  }
-}
-
-// PUT - update target
-export async function PUT(
-  request: Request,
-  { params }: { params: Promise<{ id: string; targetId: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  try {
-    const { id, targetId } = await params;
-    const body = await request.json();
-    await updateTarget(id, targetId, body);
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    return NextResponse.json({ error: "Failed to update target" }, { status: 500 });
-  }
-}
-
-// DELETE target
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string; targetId: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  try {
-    const { id, targetId } = await params;
-    await deleteTarget(id, targetId);
-    return NextResponse.json({ success: true });
-  } catch (error) {
-    return NextResponse.json({ error: "Failed to delete target" }, { status: 500 });
+    console.error("POST targets failed:", error);
+    return NextResponse.json({ error: "添加失败" }, { status: 500 });
   }
 }

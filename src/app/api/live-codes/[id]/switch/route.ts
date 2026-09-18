@@ -1,47 +1,39 @@
-import { kv } from "@vercel/kv";
 import { NextResponse } from "next/server";
+import { isAdmin, unauthorized } from "@/lib/auth";
+import { getLiveCode, getTarget, activateTarget } from "@/lib/db";
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+export const dynamic = "force-dynamic";
 
-function verifyAdmin(req: Request): boolean {
-  const auth = req.headers.get("authorization");
-  return auth === `Bearer ${ADMIN_PASSWORD}`;
+interface RouteContext {
+  params: { id: string };
 }
 
-export async function POST(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+/** POST /api/live-codes/:id/switch —— 切换当前展示的目标 */
+export async function POST(request: Request, { params }: RouteContext) {
+  if (!isAdmin(request)) return unauthorized();
 
   try {
-    const { id } = await params;
+    const code = await getLiveCode(params.id);
+    if (!code) {
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
+    }
+
     const body = await request.json();
-    const { targetId } = body;
+    const targetId = String(body.targetId || "");
 
     if (!targetId) {
-      return NextResponse.json({ error: "targetId is required" }, { status: 400 });
+      return NextResponse.json({ error: "缺少 targetId" }, { status: 400 });
     }
 
-    // Get all targets
-    const targetsRaw = await kv.lrange(`targets:${id}`, 0, -1);
-    const targets = targetsRaw.map((t) => JSON.parse(t));
-
-    // Set active
-    for (const target of targets) {
-      target.is_active = target.id === targetId ? 1 : 0;
+    const target = await getTarget(targetId);
+    if (!target || target.live_code_id !== code.id) {
+      return NextResponse.json({ error: "目标不存在" }, { status: 404 });
     }
 
-    // Save back
-    await kv.del(`targets:${id}`);
-    for (const target of targets) {
-      await kv.lpush(`targets:${id}`, JSON.stringify(target));
-    }
-
+    await activateTarget(code.id, targetId);
     return NextResponse.json({ success: true });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to switch target" }, { status: 500 });
+    console.error("switch target failed:", error);
+    return NextResponse.json({ error: "切换失败" }, { status: 500 });
   }
 }

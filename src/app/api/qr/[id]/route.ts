@@ -1,78 +1,71 @@
-import { kv } from "@vercel/kv";
 import { NextResponse } from "next/server";
 import QRCode from "qrcode";
+import { getLiveCode, getActiveTarget } from "@/lib/db";
 
-interface LiveCode {
-  id: string;
-  name: string;
-  description: string;
-  type: "qr" | "link" | "file";
-  created_at: string;
-}
+export const dynamic = "force-dynamic";
 
-interface Target {
-  id: string;
-  live_code_id: string;
-  type: "qr" | "link" | "file";
-  value: string;
-  image?: string;
-  label: string;
-  note: string;
-  is_active: number;
-  created_at: string;
-}
-
-async function getLiveCode(id: string): Promise<LiveCode | null> {
-  const code = await kv.get<LiveCode>(`live_code:${id}`);
-  return code;
-}
-
-async function getTargets(codeId: string): Promise<Target[]> {
-  const targets = await kv.lrange(`targets:${codeId}`, 0, -1);
-  return targets.map((t) => JSON.parse(t));
-}
-
+/**
+ * GET /api/qr/:id —— 用户扫码后看到的展示数据
+ *
+ * 返回：
+ *  - type="qr"   -> qrDataUrl 为直接可 <img src> 的地址（上传图优先，否则按内容生成）
+ *  - type="link" -> 前端读取 activeTarget.value 渲染「点击访问」
+ *  - type="file" -> fileUrl 为下载地址，前端渲染「点击下载」
+ */
 export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
+  _request: Request,
+  { params }: { params: { id: string } }
 ) {
   try {
-    const { id } = await params;
-    const code = await getLiveCode(id);
-
+    const code = await getLiveCode(params.id);
     if (!code) {
-      return NextResponse.json({ error: "Code not found" }, { status: 404 });
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
     }
 
-    const targets = await getTargets(id);
-    const activeTarget = targets.find((t) => t.is_active === 1) || targets[0];
-
+    const activeTarget = await getActiveTarget(code.id);
     if (!activeTarget) {
-      return NextResponse.json({ error: "No targets found" }, { status: 404 });
+      return NextResponse.json(
+        { error: "该活码还没有配置目标" },
+        { status: 404 }
+      );
     }
 
-    // Generate QR code if type is qr
     let qrDataUrl: string | undefined;
-    if (activeTarget.type === "qr" && activeTarget.value) {
-      try {
-        qrDataUrl = await QRCode.toDataURL(activeTarget.value, {
-          width: 400,
-          margin: 2,
-          color: { dark: "#000000", light: "#ffffff" },
-        });
-      } catch (e) {
-        console.error("QR generation failed:", e);
+    let fileUrl: string | undefined;
+
+    if (code.type === "qr") {
+      // 上传的二维码图片优先；否则把文本内容生成二维码
+      if (activeTarget.image) {
+        qrDataUrl = activeTarget.image;
+      } else if (activeTarget.value) {
+        try {
+          qrDataUrl = await QRCode.toDataURL(activeTarget.value, {
+            width: 420,
+            margin: 2,
+            color: { dark: "#000000", light: "#ffffff" },
+          });
+        } catch (e) {
+          console.error("QR generation failed:", e);
+        }
       }
+    }
+
+    if (code.type === "file") {
+      fileUrl = activeTarget.image || activeTarget.value;
     }
 
     return NextResponse.json({
       id: code.id,
       name: code.name,
       description: code.description,
+      type: code.type,
+      targetCount: 0,
       activeTarget,
       qrDataUrl,
+      fileUrl,
     });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to fetch code" }, { status: 500 });
+    console.error("GET /api/qr/[id] failed:", error);
+    return NextResponse.json({ error: "读取失败" }, { status: 500 });
   }
 }

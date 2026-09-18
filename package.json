@@ -8,18 +8,20 @@
     "start": "next start"
   },
   "dependencies": {
-    "next": "14.2.35",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "qrcode": "^1.5.4",
+    "@vercel/blob": "^1.0.0",
     "@vercel/kv": "^3.0.0",
-    "@vercel/blob": "^1.0.0"
+    "next": "14.2.35",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20",
+    "@types/qrcode": "^1.5.0",
     "@types/react": "^18",
     "@types/react-dom": "^18",
-    "@types/qrcode": "^1.5.0",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5"
   }
 }

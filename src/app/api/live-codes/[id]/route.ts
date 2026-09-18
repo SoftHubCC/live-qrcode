@@ -1,146 +1,91 @@
-import { kv } from "@vercel/kv";
 import { NextResponse } from "next/server";
+import { isAdmin, unauthorized } from "@/lib/auth";
+import {
+  getLiveCode,
+  listTargets,
+  updateLiveCode,
+  deleteLiveCode,
+  findLiveCodeByName,
+} from "@/lib/db";
 
-interface LiveCode {
-  id: string;
-  name: string;
-  description: string;
-  type: "qr" | "link" | "file";
-  created_at: string;
+export const dynamic = "force-dynamic";
+
+interface RouteContext {
+  params: { id: string };
 }
 
-interface Target {
-  id: string;
-  live_code_id: string;
-  type: "qr" | "link" | "file";
-  value: string;
-  image?: string;
-  label: string;
-  note: string;
-  is_active: number;
-  created_at: string;
-}
-
-async function getLiveCode(id: string): Promise<LiveCode | null> {
-  const code = await kv.get<LiveCode>(`live_code:${id}`);
-  return code;
-}
-
-async function getTargets(codeId: string): Promise<Target[]> {
-  const targets = await kv.lrange(`targets:${codeId}`, 0, -1);
-  return targets.map((t) => JSON.parse(t));
-}
-
-async function saveTarget(target: Target): Promise<void> {
-  await kv.lpush(`targets:${target.live_code_id}`, JSON.stringify(target));
-}
-
-async function deleteTarget(codeId: string, targetId: string): Promise<void> {
-  const targets = await getTargets(codeId);
-  const filtered = targets.filter((t) => t.id !== targetId);
-  await kv.del(`targets:${codeId}`);
-  for (const t of filtered) {
-    await kv.lpush(`targets:${codeId}`, JSON.stringify(t));
-  }
-}
-
-async function setTargetActive(codeId: string, targetId: string): Promise<void> {
-  const targets = await getTargets(codeId);
-  for (const t of targets) {
-    t.is_active = t.id === targetId ? 1 : 0;
-  }
-  await kv.del(`targets:${codeId}`);
-  for (const t of targets) {
-    await kv.lpush(`targets:${codeId}`, JSON.stringify(t));
-  }
-}
-
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
-
-function verifyAdmin(req: Request): boolean {
-  const auth = req.headers.get("authorization");
-  return auth === `Bearer ${ADMIN_PASSWORD}`;
-}
-
-// GET single code with targets
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
+/** GET /api/live-codes/:id —— 单个活码详情 */
+export async function GET(_request: Request, { params }: RouteContext) {
   try {
-    const { id } = await params;
-    const code = await getLiveCode(id);
+    const code = await getLiveCode(params.id);
     if (!code) {
-      return NextResponse.json({ error: "Code not found" }, { status: 404 });
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
     }
-    const targets = await getTargets(id);
-    const activeTarget = targets.find((t) => t.is_active === 1) || targets[0];
+    const targets = await listTargets(code.id);
+    const active = targets.find((t) => t.is_active === 1) || targets[0];
     return NextResponse.json({
       ...code,
       targets,
-      activeIndex: targets.indexOf(activeTarget),
+      activeIndex: active ? targets.indexOf(active) : -1,
     });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to fetch code" }, { status: 500 });
+    console.error("GET /api/live-codes/[id] failed:", error);
+    return NextResponse.json({ error: "读取失败" }, { status: 500 });
   }
 }
 
-// UPDATE code
-export async function PUT(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+/** PUT /api/live-codes/:id —— 修改名称、描述 */
+export async function PUT(request: Request, { params }: RouteContext) {
+  if (!isAdmin(request)) return unauthorized();
 
   try {
-    const { id } = await params;
-    const body = await request.json();
-    const code = await getLiveCode(id);
-
+    const code = await getLiveCode(params.id);
     if (!code) {
-      return NextResponse.json({ error: "Code not found" }, { status: 404 });
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
     }
 
-    if (body.name) code.name = body.name;
-    if (body.description !== undefined) code.description = body.description;
+    const body = await request.json();
 
-    await kv.set(`live_code:${id}`, code);
-    return NextResponse.json({ success: true });
+    if (body.name !== undefined) {
+      const name = String(body.name).trim();
+      if (!name) {
+        return NextResponse.json({ error: "名称不能为空" }, { status: 400 });
+      }
+      const duplicated = await findLiveCodeByName(name, code.id);
+      if (duplicated) {
+        return NextResponse.json(
+          { error: "已存在同名活码，请换一个名称" },
+          { status: 409 }
+        );
+      }
+      code.name = name;
+    }
+
+    if (body.description !== undefined) {
+      code.description = String(body.description).trim();
+    }
+
+    await updateLiveCode(code);
+    return NextResponse.json({ success: true, code });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to update code" }, { status: 500 });
+    console.error("PUT /api/live-codes/[id] failed:", error);
+    return NextResponse.json({ error: "更新失败" }, { status: 500 });
   }
 }
 
-// DELETE code
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> }
-) {
-  if (!verifyAdmin(request)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+/** DELETE /api/live-codes/:id —— 删除活码（级联删除目标与文件） */
+export async function DELETE(request: Request, { params }: RouteContext) {
+  if (!isAdmin(request)) return unauthorized();
 
   try {
-    const { id } = await params;
-    const targets = await getTargets(id);
-    // Clean up blobs
-    for (const target of targets) {
-      if (target.image) {
-        try {
-          const url = new URL(target.image);
-          const filename = url.pathname.split("/").pop();
-          if (filename) {
-            // Blob deletion would go here if we had the handle
-          }
-        } catch (e) {}
-      }
+    const code = await getLiveCode(params.id);
+    if (!code) {
+      return NextResponse.json({ error: "活码不存在" }, { status: 404 });
     }
-    await kv.del(`live_code:${id}`);
-    await kv.del(`targets:${id}`);
+    await deleteLiveCode(code.id);
     return NextResponse.json({ success: true });
   } catch (error) {
-    return NextResponse.json({ error: "Failed to delete code" }, { status: 500 });
+    console.error("DELETE /api/live-codes/[id] failed:", error);
+    return NextResponse.json({ error: "删除失败" }, { status: 500 });
   }
 }
